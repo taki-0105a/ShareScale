@@ -1,0 +1,6 @@
+# リリースの tarball（scripts/release/make-release.sh の git archive）に入れないもの。
+# 組み立てと試験に要るもの（Package.swift・Sources・Tests・assets・scripts/build-*.sh・scripts/lib・scripts/test-all.sh・VERSION）は除かない
+/docs export-ignore
+/scripts/release export-ignore
+/.gitattributes export-ignore
+/.gitignore export-ignore

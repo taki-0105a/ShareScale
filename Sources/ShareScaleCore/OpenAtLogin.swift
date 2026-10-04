@@ -4,11 +4,16 @@ import ShareScaleHostCore
 
 /// 「ログイン時に ShareScale を開く」の実物（`SMAppService.mainApp`。口は Host の常駐と同じ `LoginItemService`）
 public struct SystemAppLoginItemService: LoginItemService {
-    public init() {}
+    /// ShareScale.app（実物は `Bundle.main.bundleURL`）
+    public let appBundle: URL
+    public init(appBundle: URL = Bundle.main.bundleURL) { self.appBundle = appBundle }
     public func status() -> LoginItemStatus { SystemChecks.appLoginItem() }
     public func register() throws { try SystemChecks.registerAppLoginItem() }
     public func unregister() throws { try SystemChecks.unregisterAppLoginItem() }
     public func openSystemSettingsLoginItems() { SystemChecks.openLoginItemsSettings() }
+    /// 更新させるもの: ログイン時に開くのはアプリそのもの（計画 2j）
+    public var launchServicesURLs: [URL] { [appBundle] }
+    public func refreshLaunchServices() async { _ = await LaunchServicesRefresh.run(launchServicesURLs) }
 }
 
 /// 設定 › 一般 の「ログイン時に ShareScale を開く」に出すもの（純粋な値）
@@ -41,7 +46,8 @@ public final class OpenAtLoginController: ObservableObject {
     private let stateFile: AppStateFile?
     private let ownCDHash: String?
     private let sleep: (Double) async -> Void
-    /// 更新の後に登録し直す時の間（Host のログイン項目と同じ 3 秒。試作 5）
+    /// 更新の後に登録し直す時の間（3 秒。計画 2f-2 のまま。Host のログイン項目は 1 秒にした（計画 2j）が、こちらは待つものが無く、
+    /// 利用者を待たせないので変えない。試作 5 の「1 秒では足りず 3 秒なら通る」は誤りだった＝仕様「ログイン項目の登録」）
     public static let reregisterDelay = 3.0
     /// 登録し直している間（3 秒待つ間を含む）。この間は完全な削除を始めない（`UninstallFlow.available`。再点検 2f-2）
     @Published public private(set) var busy = false
@@ -52,14 +58,17 @@ public final class OpenAtLoginController: ObservableObject {
         status = Self.effective(service.status())
     }
 
-    /// 複製の起動時: 登録済み（`enabled`）で、自分の CDHash が登録した時と違えば（更新した）、解除 → 3 秒 → 登録 で登録し直す
-    /// （Host のログイン項目と同じ流儀。登録の壊れ方は試作 5。点検 2f-2）。記録が無い（2f-2 より前に登録した）時も登録し直して記録する
+    /// 複製の起動時: 登録済み（`enabled`）で、自分の CDHash が登録した時と違えば（更新した）、LaunchServices を更新 → 解除 → 3 秒 → 登録 で登録し直す
+    /// （Host のログイン項目と同じ流儀。登録の壊れ方は試作 5。点検 2f-2）。記録が無い（2f-2 より前に登録した）時も登録し直して記録する。
+    /// 次のログインで本当に開かれるかは、その場では分からない（Host と違い、応答を待てない。計画 2j「実機で確かめること」）
     public func startup() async {
         guard role == .copy, !busy, !lockedForRemoval, let own = ownCDHash, let file = stateFile else { return }
         refresh()
         guard status == .enabled, file.load().state.registeredAppCDHash != own else { return }
         busy = true
         defer { busy = false; refresh() }
+        // Host のログイン項目と同じく、登録し直しの前に LaunchServices の登録を新しい中身で更新させる（効くかは未確認。計画 2j）
+        await service.refreshLaunchServices()
         try? service.unregister()
         await sleep(Self.reregisterDelay)
         // 待つ間に取り除きが始まっていたら登録し直さない（取り除きが消すものを作り直さない。再点検 2f-2）

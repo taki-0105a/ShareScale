@@ -44,6 +44,7 @@ struct FixedLoginItem: LoginItemService {
     func register() throws {}
     func unregister() throws {}
     func openSystemSettingsLoginItems() {}
+    func refreshLaunchServices() async {}
 }
 
 /// 許可の状態を固定した通知の口（許可を求めない・送らない）

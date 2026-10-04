@@ -14,6 +14,8 @@ final class FakeLoginItem: LoginItemService, @unchecked Sendable {
     /// 登録・解除の時に呼ぶ（Host の起動・終了を表す）
     var onRegister: () -> Void = {}
     var onUnregister: () -> Void = {}
+    /// LaunchServices の更新の時に呼ぶ（計画 2j）
+    var onRefresh: () -> Void = {}
     init(_ s: LoginItemStatus) { _status = s }
     var calls: [String] { lock.withLock { _calls } }
     func record(_ c: String) { lock.withLock { _calls.append(c) } }
@@ -30,6 +32,15 @@ final class FakeLoginItem: LoginItemService, @unchecked Sendable {
         set(.notRegistered); onUnregister()
     }
     func openSystemSettingsLoginItems() { record("open") }
+    func refreshLaunchServices() async { record("refresh"); onRefresh() }
+}
+
+/// 呼ばれた URL を記録する（裏のスレッドから呼ばれる）
+final class URLRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _all: [URL] = []
+    var all: [URL] { lock.withLock { _all } }
+    func add(_ u: URL) { lock.withLock { _all.append(u) } }
 }
 
 /// ログイン項目の登録・解除（仕様「ログイン項目の登録」。時間の待ちは数えるだけで待たない）
@@ -47,6 +58,24 @@ final class LoginItemControllerTests: TempDirTestCase {
         var startsAfter: Double?
         var startedPID: Int64 = 200
         var total: Double { slept.reduce(0, +) }
+        /// 登録した回数（更新の後の登録し直しの試験で、何回目の起動が止められるかを決める。計画 2j）
+        var registers = 0
+        /// 応答を待つ間の 0.25 秒を除いた待ち（解除の後の待ち・やり直しの前の待ち）
+        var waits: [Double] { slept.filter { $0 != 0.25 } }   // 0.25 = `LoginItemController.pollInterval`（`testUpdateTimingValues` が縛る）
+    }
+
+    /// 更新の後の登録し直し（計画 2j）: 前の版の Host（pid 100）が動いていて、記録した CDHash が違う。
+    /// `blocked` 回目までの登録では Host が起動しない（macOS に止められた）。それより後の登録では 0.5 秒で起動する（`never` なら起動しない）
+    func updated(blocked: Int, never: Bool = false, distribution: DistributionStatus? = nil) throws -> (FakeLoginItem, Clock, LoginItemController) {
+        let service = FakeLoginItem(.enabled)
+        let clock = Clock(); clock.pid = 100
+        service.onUnregister = { clock.pid = nil; clock.startsAfter = nil }
+        service.onRegister = {
+            clock.registers += 1
+            if !never, clock.registers > blocked { clock.startsAfter = clock.total + 0.5 }
+        }
+        try stateFile.save(AppState(registeredCDHash: "0a0a"))
+        return (service, clock, controller(service, own: "0b0b", clock: clock, distribution: distribution))
     }
 
     func controller(_ service: FakeLoginItem, role: AppRole = .copy, own: String? = "aa", clock: Clock, distribution: DistributionStatus? = nil,
@@ -203,7 +232,7 @@ final class LoginItemControllerTests: TempDirTestCase {
         XCTAssertFalse(EmbeddedHost.isPresent(in: third), "Host.app/Contents のリンクも認めない")
     }
 
-    // 複製の起動時: CDHash が変わっていれば 解除 → 3 秒 → 登録（同じなら何もしない。開発の組み立ては自動では登録し直さない）
+    // 複製の起動時: CDHash が変わっていれば LaunchServices を更新 → 解除 → 1 秒 → 登録（同じなら何もしない。開発の組み立ては自動では登録し直さない）
     func testStartupReRegistersWhenTheCDHashChanged() async throws {
         let service = FakeLoginItem(.enabled)
         let clock = Clock(); clock.pid = 100
@@ -212,12 +241,12 @@ final class LoginItemControllerTests: TempDirTestCase {
         try stateFile.save(AppState(registeredCDHash: "0a0a"))
         let c = controller(service, own: "0b0b", clock: clock)
         await c.startup()
-        XCTAssertEqual(service.calls, ["unregister", "register"])
-        XCTAssertEqual(clock.slept.first, 3, "解除の後 3 秒（試作 5）")
+        XCTAssertEqual(service.calls, ["refresh", "unregister", "register"])
+        XCTAssertEqual(clock.slept.first, 1, "解除の後 1 秒（計画 2j。待ちの長さは、止められるかを決めない）")
         XCTAssertEqual(stateFile.load().state.registeredCDHash, "0b0b")
         XCTAssertEqual(c.model.result, "新しいバージョンの ShareScale Host に切り替えました。")
         await c.startup()
-        XCTAssertEqual(service.calls, ["unregister", "register"], "同じ CDHash なら登録し直さない")
+        XCTAssertEqual(service.calls, ["refresh", "unregister", "register"], "同じ CDHash なら登録し直さない")
         // 登録していない・開発の組み立て・署名の無い組み立てでは何もしない
         let off = FakeLoginItem(.notRegistered)
         await controller(off, own: "0c", clock: Clock()).startup()
@@ -240,22 +269,204 @@ final class LoginItemControllerTests: TempDirTestCase {
         XCTAssertEqual(service.calls, [])
         service.set(.enabled)
         c.refresh()
-        await waitOnMain(3) { service.calls == ["unregister", "register"] && !c.busy }
-        XCTAssertEqual(service.calls, ["unregister", "register"])
+        await waitOnMain(3) { service.calls == ["refresh", "unregister", "register"] && !c.busy }
+        XCTAssertEqual(service.calls, ["refresh", "unregister", "register"])
         XCTAssertEqual(stateFile.load().state.registeredCDHash, "0b0b")
     }
 
-    // 「ログイン時に ShareScale を開く」も、更新（CDHash が変わった）の後は 解除 → 3 秒 → 登録（点検 2f-2）
+    // 更新の後の登録し直しの待ち時間（計画 2j。根拠は仕様「ログイン項目の登録」の実測）。オンにした時（初めての登録）は前のまま
+    func testUpdateTimingValues() {
+        XCTAssertEqual(LoginItemController.reregisterDelay, 1, "解除の後の待ち")
+        XCTAssertEqual(LoginItemController.updateResponseTimeout, 3, "1 回目の応答の待ち")
+        XCTAssertEqual(LoginItemController.updateRetryDelay, 3, "止められた後の、解除から登録までの待ち")
+        XCTAssertEqual(LoginItemController.responseTimeout, 10, "やり直しの後の応答の待ち（オンにした時の待ちと同じ）")
+        XCTAssertEqual(LoginItemController.retryDelay, 5, "オンにした時のやり直しの前の待ち（前のまま）")
+        XCTAssertEqual(LoginItemController.updateFinalRetryDelay, 5, "2 回目も来ない時の、3 回目の前の待ち（止められてから 15 秒以上空ける。点検 2j-A）")
+        XCTAssertEqual(LoginItemController.pollInterval, 0.25)
+        XCTAssertEqual(LoginItemController.updateTiming, .init(firstResponse: 3, retries: [.init(delay: 3, response: 10), .init(delay: 5, response: 10)]))
+        XCTAssertEqual(LoginItemController.turnOnTiming, .init(firstResponse: 10, retries: [.init(delay: 5, response: 10)]))
+    }
+
+    // 更新の後、1 回目の起動が通る: LaunchServices を更新 → 解除 → 1 秒 → 登録 → 0.5 秒で応答（計画 2j）
+    func testUpdateReRegisterPassesOnTheFirstLaunch() async throws {
+        let distribution = DistributionStatus()
+        let (service, clock, c) = try updated(blocked: 0, distribution: distribution)
+        await c.startup()
+        XCTAssertEqual(service.calls, ["refresh", "unregister", "register"], "LaunchServices の更新は解除の前")
+        XCTAssertEqual(clock.waits, [1])
+        XCTAssertEqual(clock.total, 1.5, accuracy: 0.001)
+        XCTAssertEqual(c.model.result, "新しいバージョンの ShareScale Host に切り替えました。"); XCTAssertFalse(c.model.resultIsError)
+        XCTAssertEqual(stateFile.load().state.registeredCDHash, "0b0b")
+        XCTAssertEqual(distribution.lines.map(\.text), ["ログイン項目: 新しいバージョンの ShareScale Host に切り替えました。"])
+        XCTAssertFalse(c.busy)
+    }
+
+    // 更新の後、1 回目の起動が macOS に止められる（2026-10-02〜04 実機。時間を空けた更新ではこれまですべて止められた。決め手は分かっていない）: 3 秒で見切り、解除 → 3 秒 → 登録で戻す（計画 2j）
+    func testUpdateReRegisterRecoversQuicklyWhenTheFirstLaunchIsBlocked() async throws {
+        let distribution = DistributionStatus()
+        let (service, clock, c) = try updated(blocked: 1, distribution: distribution)
+        await c.startup()
+        XCTAssertEqual(service.calls, ["refresh", "unregister", "register", "unregister", "register"], "LaunchServices の更新は 1 回だけ")
+        XCTAssertEqual(clock.waits, [1, 3], "解除の後 1 秒、やり直しの前 3 秒")
+        XCTAssertEqual(clock.total, 1 + 3 + 3 + 0.5, accuracy: 0.001, "前は 3 + 10 + 5 + 応答＝約 20 秒")
+        XCTAssertEqual(c.model.result, "新しいバージョンの ShareScale Host に切り替えました。", "やり直しで戻っても「切り替えました」")
+        XCTAssertFalse(c.model.resultIsError)
+        XCTAssertEqual(stateFile.load().state.registeredCDHash, "0b0b", "やり直しで応答すれば記録する")
+        XCTAssertEqual(distribution.lines.map(\.mark), [.ok])
+    }
+
+    // 更新の後、2 回目も止められた: 解除 → 5 秒 → 3 回目の登録で戻す（止められてから 15 秒以上後。点検 2j-A。
+    // 止められた後に通った記録は、どれも止められてから 11 秒以上後の登録だった）
+    func testUpdateReRegisterPassesOnTheThirdTry() async throws {
+        let distribution = DistributionStatus()
+        let (service, clock, c) = try updated(blocked: 2, distribution: distribution)
+        await c.startup()
+        XCTAssertEqual(service.calls, ["refresh", "unregister", "register", "unregister", "register", "unregister", "register"])
+        XCTAssertEqual(clock.waits, [1, 3, 5], "解除の後 1 秒、2 回目の前 3 秒、3 回目の前 5 秒")
+        XCTAssertEqual(clock.total, 1 + 3 + 3 + 10 + 5 + 0.5, accuracy: 0.001, "1 回目の登録から 3 回目の登録までは 21 秒")
+        XCTAssertEqual(c.model.result, "新しいバージョンの ShareScale Host に切り替えました。"); XCTAssertFalse(c.model.resultIsError)
+        XCTAssertEqual(stateFile.load().state.registeredCDHash, "0b0b", "3 回目で応答すれば記録する")
+        XCTAssertEqual(distribution.lines.map(\.mark), [.ok])
+    }
+
+    // 更新の後、3 回とも応答が無い: 1 + 3 + 3 + 10 + 5 + 10 ＝ 32 秒で「応答がありません」。記録しない（次に開いた時にもう一度。点検 L）
+    func testUpdateReRegisterGivesUpAfterThreeTries() async throws {
+        let (service, clock, c) = try updated(blocked: 0, never: true)
+        await c.startup()
+        XCTAssertEqual(service.calls, ["refresh", "unregister", "register", "unregister", "register", "unregister", "register"])
+        XCTAssertEqual(clock.slept, [1] + Array(repeating: 0.25, count: 12) + [3] + Array(repeating: 0.25, count: 40) + [5] + Array(repeating: 0.25, count: 40),
+                       "待ちの順序と値")
+        XCTAssertEqual(clock.total, 32, accuracy: 0.001)
+        XCTAssertEqual(c.model.result, "ShareScale Host を登録しましたが、応答がありません。「この Mac を接続先にする」をオフにしてからオンにしてください。")
+        XCTAssertTrue(c.model.resultIsError)
+        XCTAssertEqual(stateFile.load().state.registeredCDHash, "0a0a", "応答が無ければ記録しない")
+        XCTAssertFalse(c.busy)
+    }
+
+    // 上限ちょうど（登録から 3 秒）で応答する Host: 1 回目で通る（応答を見てから上限を見る順。点検 2j-B）
+    func testUpdateReRegisterAcceptsAnAnswerExactlyAtTheLimit() async throws {
+        let (service, clock, c) = try updated(blocked: 0)
+        service.onRegister = { clock.registers += 1; clock.startsAfter = clock.total + 3 }   // 3 = `updateResponseTimeout`（`testUpdateTimingValues` が縛る）
+        await c.startup()
+        XCTAssertEqual(service.calls, ["refresh", "unregister", "register"])
+        XCTAssertEqual(clock.total, 1 + 3, accuracy: 0.001)
+        XCTAssertEqual(c.model.result, "新しいバージョンの ShareScale Host に切り替えました。")
+        XCTAssertEqual(stateFile.load().state.registeredCDHash, "0b0b")
+    }
+
+    // やり直しの登録（2 回目・3 回目）が投げた: そこで止めて「登録できませんでした」。記録しない（再点検 2j）
+    func testUpdateReRegisterStopsWhenARetriedRegisterThrows() async throws {
+        for failingAt in [2, 3] {
+            let (service, clock, c) = try updated(blocked: 2)
+            service.onRegister = { [onRegister = service.onRegister] in onRegister(); if clock.registers == failingAt - 1 { service.failRegister = true } }
+            await c.startup()
+            let expected = ["refresh", "unregister", "register", "unregister", "register", "unregister", "register"].prefix(failingAt == 2 ? 5 : 7)
+            XCTAssertEqual(service.calls, Array(expected), "\(failingAt) 回目の登録で止める")
+            XCTAssertEqual(c.model.result, "ShareScale Host をログイン項目に登録できませんでした。もう一度試すか、システム設定 › 一般 › ログイン項目を確認してください。")
+            XCTAssertTrue(c.model.resultIsError); XCTAssertTrue(c.model.resultDetail?.contains("SMAppServiceErrorDomain") == true)
+            XCTAssertEqual(stateFile.load().state.registeredCDHash, "0a0a", "記録しない")
+            XCTAssertFalse(c.busy)
+        }
+    }
+
+    // 遅いだけの Host（登録から 3.5 秒で応答する）: 3 秒で見切って解除しても、やり直しで戻り、記録する（点検 2j-A）
+    func testUpdateReRegisterWithASlowHost() async throws {
+        let (service, clock, c) = try updated(blocked: 0)
+        service.onRegister = { clock.registers += 1; clock.startsAfter = clock.total + 3.5 }
+        await c.startup()
+        XCTAssertEqual(service.calls, ["refresh", "unregister", "register", "unregister", "register"])
+        XCTAssertEqual(clock.waits, [1, 3])
+        XCTAssertEqual(clock.total, 1 + 3 + 3 + 3.5, accuracy: 0.001)
+        XCTAssertEqual(c.model.result, "新しいバージョンの ShareScale Host に切り替えました。")
+        XCTAssertEqual(stateFile.load().state.registeredCDHash, "0b0b")
+    }
+
+    // 更新の後、登録したらログイン項目でオフ（requiresApproval）になった: やり直さない（1 回目・やり直しの後のどちらでも。計画 2j）
+    func testUpdateReRegisterStopsAtRequiresApproval() async throws {
+        let (first, clock1, c1) = try updated(blocked: 0)
+        first.statusAfterRegister = .requiresApproval
+        await c1.startup()
+        XCTAssertEqual(first.calls, ["refresh", "unregister", "register"])
+        XCTAssertEqual(clock1.waits, [1]); XCTAssertTrue(c1.model.needsApproval); XCTAssertNil(c1.model.result, "画面には出さない（スイッチの下の説明と同じ手順）")
+        XCTAssertEqual(stateFile.load().state.registeredCDHash, "0a0a")
+        // 1 回目が止められ、やり直しの登録で requiresApproval
+        let (second, clock2, c2) = try updated(blocked: 1)
+        second.onRegister = { [onRegister = second.onRegister] in onRegister(); second.statusAfterRegister = .requiresApproval }
+        await c2.startup()
+        XCTAssertEqual(second.calls, ["refresh", "unregister", "register", "unregister", "register"])
+        XCTAssertEqual(clock2.waits, [1, 3]); XCTAssertTrue(c2.model.needsApproval)
+        XCTAssertEqual(stateFile.load().state.registeredCDHash, "0a0a")
+        // 2 回目も止められ、3 回目の登録で requiresApproval（点検 2j-A）
+        let (fourth, clock4, c4) = try updated(blocked: 2)
+        fourth.onRegister = { [onRegister = fourth.onRegister] in onRegister(); if clock4.registers == 2 { fourth.statusAfterRegister = .requiresApproval } }
+        await c4.startup()
+        XCTAssertEqual(fourth.calls, ["refresh", "unregister", "register", "unregister", "register", "unregister", "register"])
+        XCTAssertEqual(clock4.waits, [1, 3, 5]); XCTAssertTrue(c4.model.needsApproval)
+        XCTAssertEqual(stateFile.load().state.registeredCDHash, "0a0a")
+        // 始めから requiresApproval なら、LaunchServices の更新もしない
+        let (third, _, c3) = try updated(blocked: 0)
+        third.set(.requiresApproval); c3.refresh()
+        await c3.startup()
+        XCTAssertEqual(third.calls, [])
+    }
+
+    // 取り除きが始まっている・待つ間に始まった: 登録し直さない（計画 2j。「ログイン時に開く」と同じ）
+    func testUpdateReRegisterStopsWhenRemovalStarts() async throws {
+        // 始めから
+        let (before, _, c0) = try updated(blocked: 0)
+        c0.lockForRemoval()
+        await c0.startup()
+        XCTAssertEqual(before.calls, [], "LaunchServices の更新もしない")
+        // k 回目の解除の後の待ち（1 秒・3 秒・5 秒）の間に。どの待ちかは、秒数ではなく、何回目の解除の直後に眠ったかで見分ける（点検 2j-B）
+        for (k, expected) in [(1, ["refresh", "unregister"]),
+                              (2, ["refresh", "unregister", "register", "unregister"]),
+                              (3, ["refresh", "unregister", "register", "unregister", "register", "unregister"])] {
+            try stateFile.save(AppState(registeredCDHash: "0a0a"))
+            let service = FakeLoginItem(.enabled)
+            let clock = Clock()
+            let distribution = DistributionStatus()
+            var c: LoginItemController?
+            var flow: UninstallFlow?
+            var busyWhileWaiting: [Bool] = []
+            var availableWhileWaiting: [Bool] = []
+            c = LoginItemController(role: .copy, service: service, stateFile: stateFile, ownCDHash: "0b0b", hostPID: { clock.pid },
+                                    sleep: { s in
+                                        clock.slept.append(s)
+                                        // 待つ間はずっと処理中で、完全な削除を始められない（再点検 2j）
+                                        busyWhileWaiting.append(c?.busy ?? false)
+                                        availableWhileWaiting.append(flow?.available ?? true)
+                                        let calls = service.calls
+                                        if calls.last == "unregister", calls.filter({ $0 == "unregister" }).count == k { c?.lockForRemoval() }
+                                    },
+                                    distribution: distribution, hostEmbedded: { true })
+            let targets = ViewerTargets(book: nil, model: ViewerModel(client: nil, displays: { [] }), onSwitch: { _ in })
+            flow = UninstallFlow(role: .copy, paths: AppPaths(home: dir), targets: targets, loginItems: c) {
+                UninstallPorts(loginItem: FakeLoginItem(.notRegistered), hostState: { .stopped }, hostProcessRunning: { false }, askHostToQuit: {},
+                               unpair: { _ in .alreadyRemoved }, trash: { _ in }, removeDefaults: { _ in })
+            }
+            XCTAssertEqual(flow?.available, true, "始める前は押せる")
+            await c?.startup()
+            XCTAssertFalse(busyWhileWaiting.isEmpty)
+            XCTAssertEqual(busyWhileWaiting, Array(repeating: true, count: busyWhileWaiting.count), "待つ間はずっと処理中（\(k)）")
+            XCTAssertEqual(availableWhileWaiting, Array(repeating: false, count: availableWhileWaiting.count), "待つ間は完全な削除を押せない（\(k)）")
+            XCTAssertEqual(service.calls, expected, "\(k) 回目の解除の後の待ちの間に取り除きが始まった")
+            XCTAssertNil(c?.model.result); XCTAssertEqual(distribution.lines, [], "結果は取り除きの窓が出す")
+            XCTAssertEqual(c?.busy, false)
+            XCTAssertEqual(stateFile.load().state.registeredCDHash, "0a0a")
+        }
+    }
+
+    // 「ログイン時に ShareScale を開く」も、更新（CDHash が変わった）の後は LaunchServices を更新 → 解除 → 3 秒 → 登録（点検 2f-2・計画 2j）
     func testOpenAtLoginReRegistersAfterAnUpdate() async throws {
         let app = FakeLoginItem(.enabled)
         var slept: [Double] = []
         try stateFile.save(AppState(registeredAppCDHash: "0a0a"))
         let c = OpenAtLoginController(role: .copy, service: app, stateFile: stateFile, ownCDHash: "0b0b", sleep: { slept.append($0) })
         await c.startup()
-        XCTAssertEqual(app.calls, ["unregister", "register"]); XCTAssertEqual(slept, [3])
+        XCTAssertEqual(app.calls, ["refresh", "unregister", "register"], "LaunchServices の更新は解除の前（計画 2j）"); XCTAssertEqual(slept, [3])
         XCTAssertEqual(stateFile.load().state.registeredAppCDHash, "0b0b")
         await c.startup()
-        XCTAssertEqual(app.calls, ["unregister", "register"], "同じ CDHash なら登録し直さない")
+        XCTAssertEqual(app.calls, ["refresh", "unregister", "register"], "同じ CDHash なら登録し直さない（LaunchServices の更新もしない）")
         // スイッチでオン・オフした時にも記録する・消す
         c.setEnabled(false)
         XCTAssertNil(stateFile.load().state.registeredAppCDHash)
@@ -289,12 +500,51 @@ final class LoginItemControllerTests: TempDirTestCase {
         XCTAssertEqual(flow?.available, true)
         await controller?.startup()
         XCTAssertEqual(availableWhileWaiting, false, "待つ間は完全な削除を押せない")
-        XCTAssertEqual(during.calls, ["unregister"], "待つ間に取り除きが始まったら登録し直さない")
+        XCTAssertEqual(during.calls, ["refresh", "unregister"], "待つ間に取り除きが始まったら登録し直さない")
         // 登録し直せなかったら理由を出す
         let failing = FakeLoginItem(.enabled); failing.failRegister = true
         let f = OpenAtLoginController(role: .copy, service: failing, stateFile: stateFile, ownCDHash: "0d0d", sleep: { _ in })
         await f.startup()
         XCTAssertEqual(f.model.result, "ログイン時に開く設定を、新しいバージョンで登録し直せませんでした。スイッチをオフにしてからオンにしてください。")
+    }
+
+    // LaunchServices の更新（計画 2j）: URL の順にすべて呼び、失敗しても続ける。返事が無ければ上限で待つのをやめ、
+    // 見切った後は残りを始めない（点検 2j-B）。実物の LaunchServices には触れない
+    func testLaunchServicesRefreshCallsEveryURLAndNeverWaitsLong() async throws {
+        let app = URL(fileURLWithPath: "/tmp/x/ShareScale.app")
+        let urls = [app.appendingPathComponent(EmbeddedHost.relativePath), app]
+        let seen = URLRecorder()
+        let r = await LaunchServicesRefresh.run(urls, limit: 5) { u in seen.add(u); return u == urls[0] ? -10814 : 0 }
+        XCTAssertEqual(seen.all, urls, "順に、すべて")
+        XCTAssertEqual(r, [-10814, 0], "1 つ目が失敗しても 2 つ目を呼ぶ")
+        // 1 つ目の返事が無い（LaunchServices が止まっている）: 上限で待つのをやめ、待ちきれなかったものは nil。2 つ目は、1 つ目が戻った後も始めない
+        let gate = DispatchSemaphore(value: 0)
+        let stalled = URLRecorder()
+        let start = Date()
+        let slow = await LaunchServicesRefresh.run(urls, limit: 0.2) { u in stalled.add(u); _ = gate.wait(timeout: .now() + 3); return 0 }
+        XCTAssertLessThan(Date().timeIntervalSince(start), 1.5, "上限（0.2 秒）で待つのをやめる")
+        XCTAssertEqual(slow, [nil, nil])
+        gate.signal()
+        try await Task.sleep(nanoseconds: 300_000_000)   // 1 つ目の呼び出しが戻り、ループが次へ進む時間
+        XCTAssertEqual(stalled.all, [urls[0]], "見切った後は、2 つ目を始めない（後に続く解除・登録と重ねない）")
+        gate.signal()
+        let none = await LaunchServicesRefresh.run([], limit: 5) { _ in 0 }
+        XCTAssertEqual(none, [])
+        XCTAssertEqual(LaunchServicesRefresh.timeout, 2, "実物の上限")
+        // 実物が更新させるもの（URL を作るだけで、呼ばない）: Host のログイン項目は、中にある時だけ Host.app（先に。リンクは認めない。点検 2j-A・B）とアプリ。
+        // ログイン時に開くのはアプリ
+        XCTAssertEqual(SystemLoginItemService(appBundle: app).launchServicesURLs, [app], "中に Host が無い")
+        XCTAssertEqual(SystemAppLoginItemService(appBundle: app).launchServicesURLs, [app])
+        let bundle = support.appendingPathComponent("ShareScale.app")
+        let host = bundle.appendingPathComponent(EmbeddedHost.relativePath)
+        try FileManager.default.createDirectory(at: host.appendingPathComponent("Contents"), withIntermediateDirectories: true)
+        let plist = try PropertyListSerialization.data(fromPropertyList: ["CFBundleIdentifier": "io.github.taki-0105a.ShareScale.Host"], format: .xml, options: 0)
+        try plist.write(to: host.appendingPathComponent("Contents/Info.plist"))
+        XCTAssertEqual(SystemLoginItemService(appBundle: bundle).launchServicesURLs.map(\.path), [host.path, bundle.path], "中に Host がある（Host.app を先に）")
+        let linked = support.appendingPathComponent("Linked.app")
+        try FileManager.default.createDirectory(at: linked.appendingPathComponent("Contents/Library/LoginItems"), withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: linked.appendingPathComponent(EmbeddedHost.relativePath), withDestinationURL: host)
+        XCTAssertEqual(SystemLoginItemService(appBundle: linked).launchServicesURLs, [linked], "Host.app がリンクなら渡さない")
     }
 
     func testRolesAndFailures() async {

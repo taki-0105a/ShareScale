@@ -138,6 +138,7 @@ struct FixedLoginItem: LoginItemService {
     func register() throws {}
     func unregister() throws {}
     func openSystemSettingsLoginItems() {}
+    func refreshLaunchServices() async {}
 }
 /// 「この Mac を接続先にする」の表示（`LoginItemController.model` から。書き込まない一時の置き場所）
 @MainActor func hostSwitch(_ status: LoginItemStatus, role: AppRole = .copy) -> HostSwitchModel {

@@ -270,7 +270,7 @@ TLS の受け側は、どの PSK で成立したかを公開 API で読めない
 - **引き渡しの条件**（Homebrew 側から複製を作る・置き換える時と、複製が Homebrew 側を開く時）: Homebrew 側のバンドルの中のすべての項目の所有者が本人で、グループ・他人が書けず、シンボリックリンクと ACL が無いこと。上位のフォルダは `/` まで、所有者が本人か root で、他人が書けないこと（グループの書き込みは gid 80 の時だけ許す）。満たさなければ自動では入れ替えず、予備の手順を案内する（Homebrew の持ち主がほかの利用者の `~/Applications` とログイン項目に自分のプログラムを入れることを防ぐ）
 - 複製の置き換え: 動いている複製に終了を頼み（5 秒で終わらなければ中止）、`~/Applications` の一時的な名前に複製し（`~/Applications` は本人のもので、グループ・他人が書けず、書き込みを許す ACL が無い時だけ使う）、署名を要件 `identifier "io.github.taki-0105a.ShareScale" and cdhash H"<自分の CDHash>"` で確かめ、`renamex_np(RENAME_SWAP)` で不可分に入れ替える
 - 複製の起動時: Homebrew 側の版が新しい（または同じ版で CDHash が違う）なら、条件を確かめ、試みを記録してから Homebrew 側を開いて終了する（同じ版と CDHash への引き渡しは 1 回だけ）。常駐している間に新しい版を見つけたら、「新しいバージョンがあります」と「ShareScale を終了して開き直す…」を出す
-- ログイン項目: 複製は起動時、自分の CDHash と最後に登録した時の CDHash が違えば、解除 → 3 秒 → 登録で登録し直す。`requiresApproval`（利用者がオフにした）なら登録し直さずに案内する。formula の `post_install` からは登録しない
+- ログイン項目: 複製は起動時、自分の CDHash と最後に登録した時の CDHash が違えば、LaunchServices の登録を新しい中身で更新させ（`LSRegisterURL`）、解除 → 1 秒 → 登録で登録し直す。Host の応答が 3 秒無ければ、解除 → 3 秒 → 登録をもう 1 回行って最大 10 秒待ち、それでも無ければ 解除 → 5 秒 → 登録をもう 1 回行って最大 10 秒待つ（更新の後の 1 回目の起動を macOS が止めることがあるため。macOS 27 で確認。簡易署名の Host は起動の条件が指紋（cdhash）で固定されている。LaunchServices の更新で止められなくなるかは未確認）。「ログイン時に ShareScale を開く」も、LaunchServices を更新してから 解除 → 3 秒 → 登録で登録し直す。`requiresApproval`（利用者がオフにした）なら登録し直さずに案内する。formula の `post_install` からは登録しない
 - 「ログイン時に ShareScale を開く」（`SMAppService.mainApp`）は既定でオフで、複製だけがオンにできる
 
 ## 完全な削除

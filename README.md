@@ -108,6 +108,7 @@ The design (threat model, protocol, storage, distribution, diagnostics) is descr
 ## Limitations and known issues
 
 - ShareScale is ad-hoc signed and not notarized (it is built on your Mac, so Gatekeeper does not block it). Because of this, after an update or a rebuild macOS may ask again for Local Network access, or for the firewall to allow incoming connections to ShareScale Host.
+- When you open ShareScale right after an update, ShareScale Host can take about 10 seconds to start, and Console may show one crash report (rarely more) in which macOS stopped the first launch of ShareScale Host (“Launch Constraint Violation”), with a “quit unexpectedly” window. ShareScale registers it again automatically, so you don’t need to do anything (confirmed on macOS 27).
 - If the macOS firewall is on, allow incoming connections for ShareScale Host (System Settings › Network › Firewall › Options). “Block all incoming connections” stops ShareScale Host from being reached. Diagnostics shows this. If ShareScale Host isn’t in the firewall’s list yet, macOS may ask the first time ShareScale Host receives a connection (confirmed on macOS 27); until you click Allow on the Host, the Mac you sit at shows “Can’t connect to the Host”.
 - ShareScale Host listens on TCP port 47651.
 - Apple silicon only. ShareScale is built for macOS 14 Sonoma or later, but it has been developed and tested only on macOS 27. It may not work on older versions. If it doesn’t, please open an issue and say which version; as with everything here, there is no promise of a fix.
